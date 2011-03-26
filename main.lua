@@ -1,5 +1,6 @@
 -- Key Manager plugin. Written by Tyler "Scuba Steve 9.0/Khalitz/Kavec/etc" Gibbons
 -- Key distribution function written by Ben "Waffles" Lawrence
+-- Some key selection code stolen from Slime's quickJump plugin
 -- Bear with me, the comments are going to get weird. I am/was a bit loopy on minocycline when I wrote this.
 
 --TODO: Cache rosters? Dunno!
@@ -15,7 +16,7 @@ local function __EXISTS(val)
 	return pcall(loadstring("return "..val))
 end
 
-local __DEBUG = true
+local __DEBUG = false
 local km = ""
 if __DEBUG then
 	km = "keymgr"
@@ -54,25 +55,28 @@ local err = "\127ff2020KEYMANAGER ERROR: "
 
 --This variable will hold our plugin
 local plug = {}
-plug.GuildList, plug.GuildListByTag, plug.queue, plug.LastUpdated = {}, {}, {}, nil
+plug.GuildList, plug.GuildListByTag, plug.queue, plug.LastUpdated, plug.VERSION = {}, {}, {}, nil, "1.0.0"
 local glist, glist_tags = plug.GuildList, plug.GuildListByTag
 
 plug.testroster = {}
 
-local function manage_keys(namelist, keyids, func)
-	for dex, keyid in pairs(keyids) do
-		for ind, name in pairs(namelist) do
-			func(keyid, name)
-		end
+local given = {}
+local function collate_cb(...)
+	local args = {...}
+end
+
+local function manage_keys(namelist, keyid, func)
+	for ind, name in pairs(namelist) do
+		func(name, keyid)
 	end
 end
 
-function plug.IssueKeys(namelist, keyids)
-	manage_keys(namelist, keyids, Keychain.giveuserkey)
+function plug.IssueKeys(namelist, keyid)
+	manage_keys(namelist, keyid, Keychain.giveuserkey)
 end
 
-function plug.RevokeKeys(namelist, keyids)
-	manage_keys(namelist, keyids, Keychain.revokekey)
+function plug.RevokeKeys(namelist, keyid)
+	manage_keys(namelist, keyid, Keychain.revokekey)
 end
 
 
@@ -116,25 +120,25 @@ function plug.GetGuildList(echo)
 	http.urlopen(guildspage, plug.response(plug.ProcessGuildList, echo))
 end
 
-function plug.ProcessGuildRoster(page, keyids, revoke)
-	if not keyids then
+function plug.ProcessGuildRoster(page, keyid, revoke)
+	if not keyid then
 		print(err .. "\127ffffffNo keys to give!")
 		return
 	end
 	local roster = {}
 	page = page:gsub("[\t\r\n]", ""):gsub(".-(<tr><td class=guildText align=left>.-)</table>.*", "%1")
 	local parse_guild_roster = function(name)
-		roster.name = true
+		table.insert(roster, name)
 	end
 	
 	page:gsub("<tr>.-<a href=\"/x/stats/%d+/\"><font class=.->(.-)</font></a>.-</tr>", parse_guild_roster)
 	
 	if revoke == 1 then
 		--Take all the keys! Bwahahahahaha!
-		plug.RevokeKeys(roster, keyids)
+		plug.RevokeKeys(roster, keyid)
 	elseif revoke == 0 then
 		--Give everyone keys, I guess
-		plug.IssueKeys(roster, keyids)
+		plug.IssueKeys(roster, keyid)
 	else
 		--We'll worry about this in a later version
 		--TODO: Write logic that removes guild keys as necessary
@@ -164,15 +168,48 @@ function plug.ManageGuildRosterByTag(guildtag, ...)
 	return true
 end
 
-function plug.GetKeys(loc)
+--Returns the ID of the first valid userkey we have an ownerkey for.
+--TODO: Give some way to select between different user keys to give
+function plug.FindKey(loc)
+	local ownerkeys, keyid, okeyid = {}, nil, nil
+	
+	for i=1, GetNumKeysInKeychain() do
+		local key = {GetKeyInfo(i)}
+		if(key[2]:find(loc, 1, true) and key[7] and key[3]) then
+			keyid = key[1]
+			okeyid = key[3]
+		elseif not key[3] then
+			ownerkeys[key[1]] = true 
+		end
+	end
+	if not ownerkeys[okeyid] then
+		print("\127ffffffYou do not have an active owner key for "..loc)
+		return false
+	elseif keyid then 
+		return keyid
+	end
+
+	
+	print("\127ffffffKeyManager could not find a user key for that sector to give. Is it created and/or labeled correctly, i.e. similar to 'Latos I-8'?")
+	return false
+end
+
+function plug.GetKey(loc)
 	--TODO: Implement this
-	return {2}
+	if not loc then return plug.FindKey(ShortLocationStr(GetCurrentSectorid())) end
+	local sectorid = SectorIDFromLocationStr(loc) or SectorIDFromLocationStr(SystemNames[GetCurrentSystemid()].." "..loc)
+	if not sectorid then
+		print("\127ffffffKeyManager could not locate that sector. Please check for spelling errors.")
+		return false
+	else
+		return plug.FindKey(ShortLocationStr(sectorid))
+	end
 end
 
 function plug.cli(func, args)
 	if (not args) or ((not args[1]) or args[1]:lower() == "help") then 
-		print(("\127ffffffUsage: /%skeys <\"Guild Name\"|TAG> [location]"):format(func))
-		print("\127ffffff\t'location' can be any valid system name, sysname + sector(i.e., 'latos i8', sectorid, or 'all'")
+		print(("\127ffffffKeyManager v%s\nUsage: /%sguildkeys <\"Guild Name\"|TAG> [location]"):format(plug.VERSION, func))
+		print("\127ffffff\t'location' can be any valid system name or sysname + sector(i.e., 'latos i8').")
 		print("\127ffffff\tIf you do not include 'location', keymanager will use your current sector to give/revoke keys instead")
 		print("\127ffffff\tYou can also do '/keymanager forceupdate' to force an update to the current Guilds cache")
 		return 
@@ -183,21 +220,22 @@ function plug.cli(func, args)
 	end
 	local revoke = (func=="revoke" and 1) or (func == "give" and 0) or nil
 	
-	local guild, keyids = args[1], plug.GetKeys(args[2])
+	local guild, keyid = args[1], plug.GetKey(args[2])
+	if not keyid then return false end
 	
 	local do_guild = function(guild, keyid, revoke)
-		if not plug.ManageGuildRosterByTag(guild, keyids, revoke) then
-			if not plug.ManageGuildRoster(guild, keyids, revoke) then
-				print("KeyManager could not find " .. guild)
+		if not plug.ManageGuildRosterByTag(guild, keyid, revoke) then
+			if not plug.ManageGuildRoster(guild, keyid, revoke) then
+				print("\127ffffffKeyManager could not find " .. guild)
 			end
 		end
 	end
 	--Update our local guild list once per four hours!
 	local update_guilds = ((not plug.LastUpdated) or gkmisc.DiffTime(gkmisc.GetGameTime(), plug.LastUpdated)%1000 > 14400) and true or false
 	if not update_guilds then
-		do_guild(guild, keyids, revoke)
+		do_guild(guild, keyid, revoke)
 	else 
-		plug.queue[do_guild] = {guild, keyids, revoke}
+		plug.queue[do_guild] = {guild, keyid, revoke}
 		plug.GetGuildList()
 	end
 		
@@ -212,7 +250,7 @@ declare(km, plug)
 --Doing it below the declare() makes sure the garbage collector doesn't punish us for not using global references
 --Lua passes tables by reference, so this works to index whatever the hell km is above.
 --Examples below
-RegisterUserCommand("revokekeys", plug.cli, "revoke")
-RegisterUserCommand("givekeys", plug.cli, "give")
+RegisterUserCommand("revokeguildkeys", plug.cli, "revoke")
+RegisterUserCommand("giveguildkeys", plug.cli, "give")
 plug.GetGuildList()
 --RegisterEvent(plug.test, "KMGR")
